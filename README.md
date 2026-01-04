@@ -1,6 +1,6 @@
 # Migration & Seeder CLI Tool
 This package supports MySQL (mysql2), PostgreSQL (pg), and SQLite (sqlite3).
-A simple Node.js CLI for generating and running database migrations and seeders with MySQL, using a custom DB wrapper.
+A simple Node.js CLI for generating Models and running database migrations and seeders with MySQL, using a custom DB wrapper.
 
 ---
 get all Usage in examples provided for any issue or support get in tourch @ `andrewkhabweri@gmail.com`
@@ -51,7 +51,7 @@ image
 file
 
 
-Migrations table Supports chainable modifiers filled Manually  :
+Migrations table Supports chainable modifiers filled can be added Manually  :
 
 .notNullable()
 
@@ -82,12 +82,12 @@ Migrations table Supports chainable modifiers filled Manually  :
 ## Setup
 
 1. download this project.
-npm i nexium-orm
+npm i lamix
 
 2. Install dependencies (if any).  
    > This tool uses `mysql2`,`pg`,`sqlite3` driver, so make sure you install your prefered driver:
- EITHER
- Configure DB via environment variables: `'DB_CONNECTION=mysql',DB_HOST`, `DB_USER`, `DB_PASS`, `DB_NAME`, `DB_PORT`, `DB_CONNECTION_LIMIT`.
+ DATABASE CONNECTION IN `.env`FILE
+ Configure DB via environment variables: `'DB_CONNECTION=mysql',DB_HOST=your db hast`, `DB_USER=your db user`, `DB_PASS=your db password`, `DB_NAME=your db name`, `DB_PORT=your db port`, `DB_CONNECTION_LIMIT=100`.
 
 ## Quick start
 for database connection use any driver of your choice eg
@@ -104,15 +104,8 @@ for database connection use any driver of your choice eg
 ```bash
 npm i lamix
 
-npm install mysql2 dotenv bcrypt
+npm install mysql2  # or pg or sqlite3
 
 ```bash
-#Make Sure you put this in package.json inside your project directory for 
-#CLI generating Commands to work
-
-"scripts": {
-  "artisan": "node ./node_modules/lamix/artisan.js"
-}
-
 # TO See All the Available CLI Commands Run in Terminal
-npm run artisan --
+npx lamix
