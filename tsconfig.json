@@ -1,0 +1,27 @@
+{
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": false,
+    "declaration": true,
+    "emitDeclarationOnly": true,
+
+    "rootDir": ".",
+    "outDir": ".",
+
+    "esModuleInterop": true,
+    "moduleResolution": "node",
+    "target": "ES2020",
+    "module": "CommonJS",
+
+    "types": ["node"],
+    "skipLibCheck": true
+  },
+  "include": [
+    "index.js",
+    "artisan.js"
+  ],
+  "exclude": [
+    "node_modules",
+    "examples"
+  ]
+}
