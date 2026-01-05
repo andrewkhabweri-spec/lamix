@@ -99,7 +99,7 @@ for database connection use any driver of your choice eg
 
 1. Install dependencies:
    ```
-   npm install
+   npm install mysql2
    ```
 ```bash
 npm i lamix
