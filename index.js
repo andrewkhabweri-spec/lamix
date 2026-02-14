@@ -1,14 +1,20 @@
 'use strict';
 
-const util = require('util');
+const util = require('node:util');
 const { performance } = require('perf_hooks');
+const { AsyncLocalStorage } = require('async_hooks');
 require('dotenv').config();
+const session = require('express-session');
+const { LRUCache } = require('lru-cache');
+const zlib = require('zlib');
 
 /* ---------------- Utilities ---------------- */
 
 function tryRequire(name) {
   try { return require(name); } catch { return null; }
 }
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 /* ---------------- Errors ---------------- */
 
@@ -17,25 +23,104 @@ class DBError extends Error {
     super(message);
     this.name = 'DBError';
     this.meta = meta;
+    if (meta.err?.stack) this.stack += `\nCaused by: ${meta.err.stack}`;
   }
 }
 
 /* ---------------- Cache ---------------- */
-
 class SimpleCache {
-  constructor() { this.map = new Map(); }
-  get(k) {
-    const e = this.map.get(k);
-    if (!e) return null;
-    if (e.ttl && Date.now() > e.ts + e.ttl) {
-      this.map.delete(k);
-      return null;
-    }
-    return e.v;
+  constructor(options = {}) {
+    const {
+      maxSizeMB = 50,          // total memory cap
+      defaultTTL = 1000 * 60 * 5, // 5 minutes
+    } = options;
+
+    this.cache = new LRUCache({
+      maxSize: maxSizeMB * 1024 * 1024, // convert MB → bytes
+      ttl: defaultTTL,
+      ttlAutopurge: true,
+      allowStale: false,
+
+      // Estimate memory usage per entry
+      sizeCalculation: (value, key) => {
+        try {
+          return Buffer.byteLength(JSON.stringify(value));
+        } catch (err) {
+          // fallback small size if stringify fails
+          return 1024;
+        }
+      },
+    });
   }
-  set(k, v, ttl = 0) { this.map.set(k, { v, ts: Date.now(), ttl }); }
-  del(k) { this.map.delete(k); }
-  clear() { this.map.clear(); }
+
+  /**
+   * Get cached value
+   * @param {string} key
+   * @returns {*} value or null
+   */
+  get(key) {
+    const value = this.cache.get(key);
+    return value === undefined ? null : value;
+  }
+
+  /**
+   * Set cache value
+   * @param {string} key
+   * @param {*} value
+   * @param {number} ttl Optional TTL in ms
+   */
+  set(key, value, ttl = 0) {
+    if (ttl > 0) {
+      this.cache.set(key, value, { ttl });
+    } else {
+      this.cache.set(key, value);
+    }
+  }
+
+  /**
+   * Delete a key
+   * @param {string} key
+   */
+  del(key) {
+    this.cache.delete(key);
+  }
+
+  /**
+   * Clear entire cache
+   */
+  clear() {
+    this.cache.clear();
+  }
+
+  /**
+   * Get cache stats (optional utility)
+   */
+  stats() {
+    return {
+      size: this.cache.size,
+      calculatedSize: this.cache.calculatedSize,
+      maxSize: this.cache.maxSize,
+    };
+  }
+}
+
+
+/* ---------------- Grammar ---------------- */
+
+class Grammar {
+  prepare(sql, bindings) {
+    return { sql, bindings };
+  }
+}
+
+class PostgresGrammar extends Grammar {
+  prepare(sql, bindings) {
+    let i = 0;
+    return {
+      sql: sql.replace(/\?/g, () => `$${++i}`),
+      bindings
+    };
+  }
 }
 
 /* ---------------- DB Core ---------------- */
@@ -44,9 +129,14 @@ class DB {
   static driver = null;
   static config = null;
   static pool = null;
-  static cache = new SimpleCache();
+
+  static cache = new SimpleCache({ maxSizeMB: 500, defaultTTL: 1000 * 60 * 2});
   static retryAttempts = 1;
-  static eventHandlers = { query: [], error: [] };
+
+  static eventHandlers = { query: [], error: [], reconnect: [] };
+
+  static _grammar = null;
+  static _als = new AsyncLocalStorage();
 
   /* ---------- Init ---------- */
 
@@ -57,6 +147,9 @@ class DB {
   } = {}) {
     this.driver = driver.toLowerCase();
     this.retryAttempts = Math.max(1, Number(retryAttempts));
+
+    this._grammar =
+      this.driver === 'pg' ? new PostgresGrammar() : new Grammar();
 
     if (config) {
       this.config = config;
@@ -103,32 +196,40 @@ class DB {
   }
 
   /* ---------- Driver ---------- */
-
   static _ensureModule() {
     if (!this.driver) this.initFromEnv();
 
+    const safeRequire = (name) => {
+      try {
+        return require(name);
+      } catch (err) {
+        if (err.code === 'ERR_REQUIRE_ASYNC_MODULE') {
+          throw new DBError(
+            `${name} is ESM-only or uses top-level await. Use a CommonJS version.`,
+            { module: name, err }
+          );
+        }
+        throw err;
+      }
+    };
+
     if (this.driver === 'mysql') {
-      const m = tryRequire('mysql2/promise');
-      if (!m) throw new DBError('Missing mysql2');
-      return m;
+      return safeRequire('mysql2/promise');
     }
 
     if (this.driver === 'pg') {
-      const m = tryRequire('pg');
-      if (!m) throw new DBError('Missing pg');
-      return m;
+      return safeRequire('pg');
     }
 
     if (this.driver === 'sqlite') {
-      const m = tryRequire('sqlite3');
-      if (!m) throw new DBError('Missing sqlite3');
-      return m;
+      return safeRequire('sqlite3');
     }
 
     throw new DBError(`Unsupported driver: ${this.driver}`);
   }
 
-  /* ---------- Connect ---------- */
+
+  /* ---------- Connection ---------- */
 
   static async connect() {
     if (this.pool) return this.pool;
@@ -137,26 +238,25 @@ class DB {
 
     if (this.driver === 'mysql') {
       this.pool = driver.createPool(this.config);
-      return this.pool;
     }
 
     if (this.driver === 'pg') {
       const { Pool } = driver;
       this.pool = new Pool(this.config);
-      return this.pool;
     }
 
     if (this.driver === 'sqlite') {
       const db = new driver.Database(this.config.filename);
-
       db.runAsync = util.promisify(db.run.bind(db));
-      db.getAsync = util.promisify(db.get.bind(db));
       db.allAsync = util.promisify(db.all.bind(db));
       db.execAsync = util.promisify(db.exec.bind(db));
 
+      await db.execAsync('PRAGMA journal_mode=WAL');
+      await db.execAsync('PRAGMA busy_timeout=5000');
+
       this.pool = {
         __sqlite_db: db,
-        query: async (sql, params = []) => {
+        async query(sql, params = []) {
           const isSelect = /^\s*(select|pragma)/i.test(sql);
           if (isSelect) return [await db.allAsync(sql, params)];
           const r = await db.runAsync(sql, params);
@@ -164,9 +264,21 @@ class DB {
         },
         close: () => new Promise((r, j) => db.close(e => e ? j(e) : r()))
       };
-
-      return this.pool;
     }
+
+    return this.pool;
+  }
+
+  static async getConnection() {
+    const store = this._als.getStore();
+    if (store?.conn) return store.conn;
+    return this.connect();
+  }
+
+  static async reconnect() {
+    await this.end();
+    this._emit('reconnect', {});
+    return this.connect();
   }
 
   static async end() {
@@ -179,159 +291,150 @@ class DB {
     }
   }
 
-  /* ---------- Query ---------- */
+  /* ---------- Core Runner ---------- */
 
-  static _pgConvert(sql, params) {
-    let i = 0;
-    return {
-      text: sql.replace(/\?/g, () => `$${++i}`),
-      values: params
-    };
-  }
-
-  static _extractTable(sql) {
-    if (typeof sql !== 'string') return null;
-
-    const cleaned = sql
-      .replace(/`|"|\[|\]/g, '')
-      .replace(/\s+/g, ' ')
-      .trim()
-      .toLowerCase();
-
-    const match =
-      cleaned.match(/\bfrom\s+([a-z0-9_]+)/) ||
-      cleaned.match(/\binto\s+([a-z0-9_]+)/) ||
-      cleaned.match(/\bupdate\s+([a-z0-9_]+)/);
-
-    return match ? match[1] : null;
-  }
-
-  static async _tableExists(table) {
-    if (!table) return true;
-
-    const pool = await this.connect();
-
-    if (this.driver === 'mysql') {
-      const [rows] = await pool.query(
-        `SELECT 1 FROM information_schema.tables 
-        WHERE table_schema = DATABASE() AND table_name = ? LIMIT 1`,
-        [table]
-      );
-      return rows.length > 0;
-    }
-
-    if (this.driver === 'pg') {
-      const res = await pool.query(
-        `SELECT 1 FROM information_schema.tables 
-        WHERE table_schema = 'public' AND table_name = $1 LIMIT 1`,
-        [table]
-      );
-      return res.rows.length > 0;
-    }
-
-    if (this.driver === 'sqlite') {
-      const [rows] = await pool.query(
-        `SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1`,
-        [table]
-      );
-      return rows.length > 0;
-    }
-
-    return true;
-  }
-
-  static async raw(sql, params = [], options = {}) {
-    const { checkTable = false } = options;
-    if (checkTable) {
-      const table = this._extractTable(sql);
-      if (table) {
-        const exists = await this._tableExists(table);
-        if (!exists) {
-          throw new DBError(`Table does not exist: ${table}`, { sql });
-        }
-      }
-    }
-
+  static async run(sql, bindings, executor, { isWrite = false } = {}) {
     let attempt = 0;
 
     while (++attempt <= this.retryAttempts) {
-      const pool = await this.connect();
       const start = performance.now();
 
       try {
-        this._emit('query', { sql, params });
+        const result = await executor();
 
-        if (this.driver === 'pg') {
-          const q = this._pgConvert(sql, params);
-          const r = await pool.query(q.text, q.values);
-          return r.rows;
-        }
+        this._emit('query', {
+          sql,
+          bindings,
+          time: performance.now() - start,
+          driver: this.driver
+        });
 
-        const [rows] = await pool.query(sql, params);
-        return rows;
-
+        return result;
       } catch (err) {
-        this._emit('error', { err, sql, params, attempt });
+        const isConnectionError =
+          err?.code === 'PROTOCOL_CONNECTION_LOST' ||
+          err?.code === 'ECONNRESET' ||
+          err?.code === 'ECONNREFUSED' ||
+          err?.code === 'ETIMEDOUT' ||
+          /dead|lost|timeout|reset|closed|connect/i.test(err.message);
 
-        if (attempt < this.retryAttempts &&
-            /dead|lost|timeout|reset/i.test(err.message)) {
-          await this.end();
-          await new Promise(r => setTimeout(r, 100 * attempt));
+        this._emit('error', {
+          err,
+          sql,
+          bindings,
+          attempt,
+          connectionError: isConnectionError
+        });
+
+        const canRetry =
+          (!isWrite || this._als.getStore()?.inTransaction) &&
+          isConnectionError;
+
+        if (canRetry && attempt < this.retryAttempts) {
+          await this.reconnect();
+          await sleep(100 * attempt);
           continue;
         }
 
-        throw new DBError('DB raw() failed', { sql, params, err });
+        throw new DBError(
+          isConnectionError ? 'DB connection failed' : 'DB query failed',
+          {
+            sql,
+            bindings,
+            attempt,
+            connectionError: isConnectionError,
+            err
+          }
+        );
       }
     }
   }
+
+  /* ---------- Queries ---------- */
+
+  static async raw(sql, bindings = []) {
+    const pool = await this.getConnection();
+    const prepared = this._grammar.prepare(sql, bindings);
+
+    return this.run(sql, bindings, async () => {
+      if (this.driver === 'pg') {
+        const r = await pool.query(prepared.sql, prepared.bindings);
+        return r.rows;
+      }
+      const [rows] = await pool.query(prepared.sql, prepared.bindings);
+      return rows;
+    });
+  }
+
+  static async affectingStatement(sql, bindings = []) {
+    const pool = await this.getConnection();
+    const prepared = this._grammar.prepare(sql, bindings);
+
+    return this.run(sql, bindings, async () => {
+      if (this.driver === 'pg') {
+        const r = await pool.query(prepared.sql, prepared.bindings);
+        return { affectedRows: r.rowCount };
+      }
+      const [r] = await pool.query(prepared.sql, prepared.bindings);
+      return r;
+    }, { isWrite: true });
+  }
+
+  static select(sql, bindings = []) { return this.raw(sql, bindings); }
+  static statement(sql, bindings = []) { return this.affectingStatement(sql, bindings); }
+  static async insert(sql, bindings = []) {
+    const r = await this.affectingStatement(sql, bindings);
+    return r.insertId ?? true;
+  }
+  static async update(sql, bindings = []) {
+    const r = await this.affectingStatement(sql, bindings);
+    return r.affectedRows ?? 0;
+  }
+  static delete(sql, bindings = []) { return this.update(sql, bindings); }
 
   /* ---------- Transactions ---------- */
 
   static async transaction(fn) {
     const pool = await this.connect();
 
-    if (this.driver === 'mysql') {
-      const c = await pool.getConnection();
+    return this._als.run({ inTransaction: true }, async () => {
+      let conn;
+
       try {
-        await c.beginTransaction();
-        const r = await fn(c);
-        await c.commit();
-        return r;
+        if (this.driver === 'mysql') {
+          conn = await pool.getConnection();
+          await conn.beginTransaction();
+          this._als.getStore().conn = conn;
+          const r = await fn(conn);
+          await conn.commit();
+          return r;
+        }
+
+        if (this.driver === 'pg') {
+          conn = await pool.connect();
+          await conn.query('BEGIN');
+          this._als.getStore().conn = conn;
+          const r = await fn(conn);
+          await conn.query('COMMIT');
+          return r;
+        }
+
+        if (this.driver === 'sqlite') {
+          await pool.__sqlite_db.execAsync('BEGIN');
+          this._als.getStore().conn = pool;
+          const r = await fn(pool);
+          await pool.__sqlite_db.execAsync('COMMIT');
+          return r;
+        }
       } catch (e) {
-        await c.rollback();
+        try {
+          await conn?.query?.('ROLLBACK');
+        } catch {}
         throw e;
       } finally {
-        c.release();
+        conn?.release?.();
       }
-    }
-
-    if (this.driver === 'pg') {
-      const c = await pool.connect();
-      try {
-        await c.query('BEGIN');
-        const r = await fn(c);
-        await c.query('COMMIT');
-        return r;
-      } catch (e) {
-        await c.query('ROLLBACK');
-        throw e;
-      } finally {
-        c.release();
-      }
-    }
-
-    if (this.driver === 'sqlite') {
-      const db = pool.__sqlite_db;
-      try {
-        await db.execAsync('BEGIN');
-        const r = await fn(pool);
-        await db.execAsync('COMMIT');
-        return r;
-      } catch (e) {
-        await db.execAsync('ROLLBACK');
-        throw e;
-      }
-    }
+    });
   }
 
   /* ---------- Helpers ---------- */
@@ -344,17 +447,18 @@ class DB {
       : `\`${id.replace(/`/g, '``')}\``;
   }
 
-  static async cached(sql, params = [], ttl = 0) {
-    const key = JSON.stringify([sql, params]);
+  static async cached(sql, bindings = [], ttl = 0) {
+    const key = JSON.stringify([sql, bindings]);
     const hit = this.cache.get(key);
     if (hit) return hit;
-    const rows = await this.raw(sql, params);
+    const rows = await this.raw(sql, bindings);
     this.cache.set(key, rows, ttl);
     return rows;
   }
 }
 
 const escapeId = s => DB.escapeId(s);
+
 
 // -----------------------------
 // MAIN Validator
@@ -831,16 +935,78 @@ class Collection extends Array {
   // -------------------------
   // Filtering
   // -------------------------
-  where(key, value) {
-    return new Collection(this.filter(item => item?.[key] === value));
+  /**
+   * Enhanced filter:
+   * - filter(fn)
+   * - filter({ key: value })
+   * - filter('key', value)
+   * - filter('key', '>', value)
+   */
+  filter(condition, operator = null, value = null) {
+
+    // 1️⃣ Callback style
+    if (typeof condition === 'function') {
+      return new Collection(
+        Array.prototype.filter.call(this, condition)
+      );
+    }
+
+    // 2️⃣ Object style
+    if (typeof condition === 'object' && !Array.isArray(condition)) {
+      return new Collection(
+        Array.prototype.filter.call(this, item =>
+          Object.entries(condition).every(
+            ([k, v]) => item?.[k] === v
+          )
+        )
+      );
+    }
+
+    // 3️⃣ Key/value or key/operator/value
+    if (typeof condition === 'string') {
+
+      // If only 2 args → assume "="
+      if (value === null) {
+        value = operator;
+        operator = '=';
+      }
+
+      return new Collection(
+        Array.prototype.filter.call(this, item => {
+          const field = item?.[condition];
+
+          switch (operator) {
+            case '=':
+            case '==':  return field == value;
+            case '===': return field === value;
+            case '!=':  return field != value;
+            case '!==': return field !== value;
+            case '>':   return field > value;
+            case '>=':  return field >= value;
+            case '<':   return field < value;
+            case '<=':  return field <= value;
+            case 'in':     return Array.isArray(value) && value.includes(field);
+            case 'not in': return Array.isArray(value) && !value.includes(field);
+            default: return false;
+          }
+        })
+      );
+    }
+
+    return new Collection();
+  }
+
+  // Laravel-style aliases
+  where(key, operator, value = null) {
+    return this.filter(key, operator, value);
   }
 
   whereNot(key, value) {
-    return new Collection(this.filter(item => item?.[key] !== value));
+    return this.filter(item => item?.[key] !== value);
   }
 
   filterNull() {
-    return new Collection(this.filter(v => v !== null && v !== undefined));
+    return this.filter(v => v !== null && v !== undefined);
   }
 
   onlyKeys(keys) {
@@ -1131,9 +1297,13 @@ class QueryBuilder {
 
   // Helper to normalize operator
   _normalizeOperator(operator) {
-    const op = operator ? operator.toUpperCase() : '=';
+    const op = operator ? operator.toUpperCase() : '='
     if (!VALID_OPERATORS.includes(op)) {
-      throw new Error(`Invalid SQL operator: ${operator}`);
+      throw new DBError('Invalid SQL operator', {
+        operator,
+        normalized: op,
+        method: '_normalizeOperator'
+      });
     }
 
     // Convert ILIKE to proper operator for MySQL
@@ -1245,6 +1415,10 @@ class QueryBuilder {
     });
   }
 
+  andWhere(...args) {
+    return this.where(...args);
+  }
+
   orWhere(columnOrObject, operatorOrValue, value) {
     if (typeof columnOrObject === 'object' && columnOrObject !== null) {
       let query = this;
@@ -1273,15 +1447,14 @@ class QueryBuilder {
   }
 
   // Example method to generate SQL
-  toSQL() {
-    if (!this.wheres.length) return '';
-    const sql = this.wheres.map((w, i) => {
-      const prefix = i === 0 ? '' : ` ${w.boolean} `;
-      return `${prefix}\`${w.column}\` ${w.operator} ?`;
-    }).join('');
-    return 'WHERE ' + sql;
-  }
-
+  // toSQL() {
+  //   if (!this.wheres.length) return '';
+  //   const sql = this.wheres.map((w, i) => {
+  //     const prefix = i === 0 ? '' : ` ${w.boolean} `;
+  //     return `${prefix}\`${w.column}\` ${w.operator} ?`;
+  //   }).join('');
+  //   return 'WHERE ' + sql;
+  // }
 
   whereRaw(sql, bindings = []) {
     return this._pushWhere({
@@ -1333,7 +1506,13 @@ class QueryBuilder {
   }
 
   whereIn(column, values = []) {
-    if (!Array.isArray(values)) throw new Error('whereIn expects array');
+    if (!Array.isArray(values)) {
+      throw new DBError('whereIn expects an array', {
+        method: 'whereIn',
+        column,
+        values
+      });
+    }
     if (!values.length) {
       return this._pushWhere({ type: 'raw', raw: '0 = 1', bindings: [] });
     }
@@ -1376,7 +1555,13 @@ class QueryBuilder {
   }
 
   whereNotIn(column, values = []) {
-    if (!Array.isArray(values)) throw new Error('whereNotIn expects array');
+    if (!Array.isArray(values)) {
+      throw new DBError('whereNotIn expects an array', {
+        method: 'whereNotIn',
+        column,
+        values
+      });
+    }
     if (!values.length) {
       return this._pushWhere({ type: 'raw', raw: '1 = 1', bindings: [] });
     }
@@ -1561,7 +1746,14 @@ class QueryBuilder {
   whereHas(relationName, callback, boolean = 'AND') {
     const relation = this.modelClass.relations()?.[relationName];
     if (!relation) {
-      throw new Error(`Relation '${relationName}' is not defined on ${this.modelClass.name}`);
+      throw new DBError(
+        `Relation '${relationName}' is not defined`,
+        {
+          model: this.modelClass?.name,
+          relation: relationName,
+          method: 'whereHas'
+        }
+      );
     }
 
     const RelatedModel = relation.model();
@@ -1625,6 +1817,16 @@ class QueryBuilder {
 
     parts.push('SELECT');
     if (this._distinct) parts.push('DISTINCT');
+
+    // Normalize SELECT * to table.* when a model is attached
+    if (
+      this.modelClass &&
+      this._select.length === 1 &&
+      this._select[0] === '*'
+    ) {
+      const table = this.tableAlias || this.table;
+      this._select = [`${escapeId(table)}.*`];
+    }
 
     parts.push(this._select.length ? this._select.join(', ') : '*');
 
@@ -1770,7 +1972,10 @@ class QueryBuilder {
           break;
 
         default:
-          throw new Error('Unknown where type: ' + w.type);
+          throw new DBError('Unknown where clause type', {
+            type: w.type,
+            where: w
+          });
       }
     });
 
@@ -1808,20 +2013,29 @@ class QueryBuilder {
     const sql = this._compileSelect();
     const binds = this._gatherBindings();
 
-    const rows = await DB.raw(sql, binds);
+    try {
+      const rows = await DB.raw(sql, binds);
 
-    if (this.modelClass) {
-      const models = rows.map(r => new this.modelClass(r, true));
+      if (this.modelClass) {
+        const models = rows.map(r => new this.modelClass(r, true));
 
-      if (this._with.length) {
-        const loaded = await this._eagerLoad(models);
-        return new Collection(loaded);
+        if (this._with.length) {
+          const loaded = await this._eagerLoad(models);
+          return new Collection(loaded);
+        }
+
+        return new Collection(models);
       }
 
-      return new Collection(models);
+      return new Collection(rows);
+    } catch (err) {
+      throw new DBError('Select query failed', {
+        table: this.table,
+        sql,
+        bindings: binds,
+        err
+      });
     }
-
-    return new Collection(rows);
   }
 
   async first() {
@@ -1834,7 +2048,13 @@ class QueryBuilder {
 
   async firstOrFail() {
     const r = await this.first();
-    if (!r) throw new Error('Record not found');
+    if (!r) {
+      throw new DBError('Record not found', {
+        method: 'firstOrFail',
+        table: this.table,
+        model: this.modelClass?.name
+      });
+    }
     return r;
   }
 
@@ -1845,10 +2065,19 @@ class QueryBuilder {
     c.limit(1);
 
     const sql = c._compileSelect();
-    const b = c._gatherBindings();
+    const bindings = c._gatherBindings();
 
-    const rows = await DB.raw(sql, b);
-    return rows.length > 0;
+    try {
+      const rows = await DB.raw(sql, bindings);
+      return rows.length > 0;
+    } catch (err) {
+      throw new DBError('Exists query failed', {
+        table: this.table,
+        sql,
+        bindings,
+        err
+      });
+    }
   }
 
   async doesntExist() {
@@ -1863,11 +2092,19 @@ class QueryBuilder {
     c._offset = null;
 
     const sql = c._compileSelect();
-    const b = c._gatherBindings();
+    const bindings = c._gatherBindings();
 
-    const rows = await DB.raw(sql, b);
-
-    return rows[0] ? Number(rows[0].aggregate) : 0;
+    try {
+      const rows = await DB.raw(sql, bindings);
+      return rows[0] ? Number(rows[0].aggregate) : 0;
+    } catch (err) {
+      throw new DBError('Count query failed', {
+        table: this.table,
+        sql,
+        bindings,
+        err
+      });
+    }
   }
 
   async _aggregate(expr) {
@@ -1878,11 +2115,20 @@ class QueryBuilder {
     c._offset = null;
 
     const sql = c._compileSelect();
-    const b = c._gatherBindings();
+    const bindings = c._gatherBindings();
 
-    const rows = await DB.raw(sql, b);
-
-    return rows[0] ? Number(rows[0].aggregate) : 0;
+    try {
+      const rows = await DB.raw(sql, bindings);
+      return rows[0] ? Number(rows[0].aggregate) : 0;
+    } catch (err) {
+      throw new DBError('Aggregate query failed', {
+        table: this.table,
+        expression: expr,
+        sql,
+        bindings,
+        err
+      });
+    }
   }
 
   sum(c) { return this._aggregate(`SUM(${escapeId(c)})`); }
@@ -1896,36 +2142,51 @@ class QueryBuilder {
     c._select = [escapeId(col)];
 
     const sql = c._compileSelect();
-    const b = c._gatherBindings();
+    const bindings = c._gatherBindings();
 
-    const rows = await DB.raw(sql, b);
-
-    return rows.map(r => r[col]);
+    try {
+      const rows = await DB.raw(sql, bindings);
+      return rows.map(r => r[col]);
+    } catch (err) {
+      throw new DBError('Pluck query failed', {
+        table: this.table,
+        column: col,
+        sql,
+        bindings,
+        err
+      });
+    }
   }
 
   async paginate(page = 1, perPage = 15) {
     page = Math.max(1, Number(page));
     perPage = Math.max(1, Number(perPage));
 
-    // Build a clone to compute total (safe — uses your existing _clone and count)
-    const countClone = this._clone();
-    countClone._select = [`COUNT(*) AS aggregate`];
-    countClone._orders = [];
-    countClone._limit = null;
-    countClone._offset = null;
+    try {
+      const countClone = this._clone();
+      countClone._select = [`COUNT(*) AS aggregate`];
+      countClone._orders = [];
+      countClone._limit = null;
+      countClone._offset = null;
 
-    const total = await countClone.count('*');
+      const total = await countClone.count('*');
 
-    const offset = (page - 1) * perPage;
+      const offset = (page - 1) * perPage;
 
-    // Use a clone to fetch rows so we don't mutate caller's builder
-    const rows = await this._clone()
-      .limit(perPage)
-      .offset(offset)
-      .get();
+      const rows = await this._clone()
+        .limit(perPage)
+        .offset(offset)
+        .get();
 
-    // Return Paginator instance with .toJSON()
-    return new Paginator(rows, total, page, perPage);
+      return new Paginator(rows, total, page, perPage);
+    } catch (err) {
+      throw new DBError('Pagination failed', {
+        table: this.table,
+        page,
+        perPage,
+        err
+      });
+    }
   }
 
   /**************************************************************************
@@ -1940,10 +2201,18 @@ class QueryBuilder {
       `) VALUES (${placeholders})`;
 
     const bindings = Object.values(values);
+    try {
+      const result = await DB.raw(sql, bindings);
 
-    const result = await DB.raw(sql, bindings);
-
-    return result.affectedRows || 0;
+      return result.affectedRows || 0;
+    } catch (err) {
+      throw new DBError('Insert failed', {
+        table: this.table,
+        sql,
+        bindings,
+        err
+      });
+    }
   }
 
   async insertGetId(values) {
@@ -1955,15 +2224,22 @@ class QueryBuilder {
       `) VALUES (${placeholders})`;
 
     const bindings = Object.values(values);
+    try {
+      const result = await DB.raw(sql, bindings);
 
-    const result = await DB.raw(sql, bindings);
-
-    return result.insertId ?? null;
+      return result.insertId ?? null;
+    } catch (err) {
+      throw new DBError('Insert (get ID) failed', {
+        table: this.table,
+        sql,
+        bindings,
+        err
+      });
+    }
   }
 
   async update(values) {
     if (!Object.keys(values).length) return 0;
-
     const setClause = Object.keys(values)
       .map(k => `${escapeId(k)} = ?`)
       .join(', ');
@@ -1973,10 +2249,18 @@ class QueryBuilder {
       `UPDATE ${escapeId(this.table)} SET ${setClause} ${whereSql}`;
 
     const bindings = [...Object.values(values), ...this._gatherBindings()];
+    try {
+      const result = await DB.raw(sql, bindings);
 
-    const result = await DB.raw(sql, bindings);
-
-    return result.affectedRows || 0;
+      return result.affectedRows || 0;
+    } catch (err) {
+      throw new DBError('Update failed', {
+        table: this.table,
+        sql,
+        bindings,
+        err
+      });
+    }
   }
 
   async increment(col, by = 1) {
@@ -1985,11 +2269,20 @@ class QueryBuilder {
       `SET ${escapeId(col)} = ${escapeId(col)} + ? ` +
       this._compileWhereOnly();
 
-    const b = [by, ...this._gatherBindings()];
+    const bindings = [by, ...this._gatherBindings()];
 
-    const res = await DB.raw(sql, b);
-
-    return res.affectedRows || 0;
+    try {
+      const res = await DB.raw(sql, bindings);
+      return res.affectedRows || 0;
+    } catch (err) {
+      throw new DBError('Increment failed', {
+        table: this.table,
+        column: col,
+        sql,
+        bindings,
+        err
+      });
+    }
   }
 
   async decrement(col, by = 1) {
@@ -1998,9 +2291,20 @@ class QueryBuilder {
       `SET ${escapeId(col)} = ${escapeId(col)} - ? ` +
       this._compileWhereOnly();
 
-    const b = [by, ...this._gatherBindings()];
-    const res = await DB.raw(sql, b);
-    return res.affectedRows || 0;
+    const bindings = [by, ...this._gatherBindings()];
+
+    try {
+      const res = await DB.raw(sql, bindings);
+      return res.affectedRows || 0;
+    } catch (err) {
+      throw new DBError('Decrement failed', {
+        table: this.table,
+        column: col,
+        sql,
+        bindings,
+        err
+      });
+    }
   }
 
   async delete() {
@@ -2008,16 +2312,34 @@ class QueryBuilder {
       `DELETE FROM ${escapeId(this.table)} ` +
       this._compileWhereOnly();
 
-    const b = this._gatherBindings();
+    const bindings = this._gatherBindings();
 
-    const res = await DB.raw(sql, b);
-    return res.affectedRows || 0;
+    try {
+      const res = await DB.raw(sql, bindings);
+      return res.affectedRows || 0;
+    } catch (err) {
+      throw new DBError('Delete failed', {
+        table: this.table,
+        sql,
+        bindings,
+        err
+      });
+    }
   }
 
   async truncate() {
     const sql = `TRUNCATE TABLE ${escapeId(this.table)}`;
-    await DB.raw(sql);
-    return true;
+
+    try {
+      await DB.raw(sql);
+      return true;
+    } catch (err) {
+      throw new DBError('Truncate failed', {
+        table: this.table,
+        sql,
+        err
+      });
+    }
   }
 
   _compileWhereOnly() {
@@ -2029,19 +2351,23 @@ class QueryBuilder {
    * EAGER LOAD (unchanged except robust checks)
    **************************************************************************/
   async _eagerLoad(models) {
+    if (!models.length) return models;
+
     for (const relName of this._with) {
-      const sample = models[0];
-      if (!sample) return models;
+      const sample = models.find(m => typeof m[relName] === 'function');
+      if (!sample) continue;
 
-      const relationMethod = sample[relName];
-      if (typeof relationMethod !== 'function') {
-        throw new Error(`Relation "${relName}" is not a method on ${sample.constructor.name}`);
-      }
-
-      const relation = relationMethod.call(sample);
+      const relation = sample[relName]();
 
       if (!relation || typeof relation.eagerLoad !== 'function') {
-        throw new Error(`Relation "${relName}" does not have a valid eagerLoad method`);
+        throw new DBError(
+          `Relation "${relName}" is not eager-loadable`,
+          {
+            model: sample.constructor.name,
+            relation: relName,
+            method: 'eagerLoad'
+          }
+        );
       }
 
       await relation.eagerLoad(models, relName);
@@ -2787,28 +3113,57 @@ class Model {
     this._relations = {};
     this._exists = !!fresh;
 
-    // Only store keys with defined values
+    // ──────────────────────────────
+    // 1️⃣ hydrate attributes safely
+    // ──────────────────────────────
     for (const [k, v] of Object.entries(attributes)) {
-      if (v !== undefined) this._attributes[k] = v;
+      if (v !== undefined) {
+        this._attributes[k] = v;
+      }
+    }
+
+    // ──────────────────────────────
+    // 2️⃣ ensure timestamps ALWAYS exist
+    // ──────────────────────────────
+    if (this.constructor.timestamps) {
+      if ('created_at' in attributes)
+        this._attributes.created_at = attributes.created_at;
+
+      if ('updated_at' in attributes)
+        this._attributes.updated_at = attributes.updated_at;
+    }
+
+    // ──────────────────────────────
+    // 3️⃣ always keep primary key
+    // ──────────────────────────────
+    const pk = this.constructor.primaryKey;
+    if (pk && pk in attributes) {
+      this._attributes[pk] = attributes[pk];
     }
 
     this._original = { ...this._attributes, ...data };
 
-    // Define getters for attributes
+    // ──────────────────────────────
+    // 4️⃣ define getters/setters FOR ALL ATTRIBUTES
+    // ──────────────────────────────
     for (const k of Object.keys(this._attributes)) {
       if (!(k in this)) {
         Object.defineProperty(this, k, {
-          get: function() {
-            return this._attributes[k];
-          },
-          enumerable: true
+          get: () => this._attributes[k],
+          set: v => { this._attributes[k] = v; },
+          enumerable: true,
+          configurable: true
         });
       }
     }
   }
 
   static async validate(data, id, ignoreId = null) {
-    if (!Validator) throw new Error('Validator not found.');
+    if (!Validator) {
+      throw new DBError('Validator not found', {
+        model: this.name
+      });
+    }
 
     const rules = this.rules || {};
 
@@ -2882,20 +3237,6 @@ class Model {
     }
   }
 
-  // ──────────────────────────────
-  // Query builder accessors
-  // ──────────────────────────────
-  // static query({ withTrashed = false } = {}) {
-  //   // use tableName getter (throws if missing)
-  //   const qb = new QueryBuilder(this.tableName, this);
-  //   if (this.softDeletes && !withTrashed) {
-  //     // avoid mutating shared _wheres reference
-  //     qb._wheres = Array.isArray(qb._wheres) ? qb._wheres.slice() : [];
-  //     qb._wheres.push({ raw: `${DB.escapeId(this.deletedAt)} IS NULL` });
-  //   }
-  //   return qb;
-  // }
-
   static query({ withTrashed = false } = {}) {
     const qb = new QueryBuilder(this.tableName, this);
 
@@ -2944,22 +3285,31 @@ class Model {
   // ──────────────────────────────
   static async all() { return await this.query().get(); }
   static where(...args) { return this.query().where(...args); }
+  // static filter(...args) { return this.query().where(...args); }
   static whereIn(col, arr) { return this.query().whereIn(col, arr); }
   static whereNot(...args) { return this.query().whereNot(...args); }
   static whereNotIn(col, arr) { return this.query().whereNotIn(col, arr); }
   static whereNull(col) { return this.query().whereNull(col); }
 
+  static filter(...args) {
+    const qb = this.query();
+    if (args.length === 1 && typeof args[0] === 'object' && !Array.isArray(args[0])) {
+      for (const [key, value] of Object.entries(args[0])) {
+        qb.where(key, value);
+      }
+      return qb;
+    }
+    return qb.where(...args);
+  }
+
   static async find(value) {
     if (value === undefined || value === null) return null;
-
     const query = this.query();
-
     // If numeric → try primary key first
     if (!isNaN(value)) {
       const row = await query.where(this.primaryKey, value).first();
       if (row) return row;
     }
-
     // Fallback or non-numeric → try slug
     return await this.query()
       .where(this.slugKey, value)
@@ -2985,14 +3335,26 @@ class Model {
   }
 
   static async findManyBy(col, values = []) {
-    if (!Array.isArray(values)) throw new Error('findManyBy expects an array of values');
+    if (!Array.isArray(values)) {
+      throw new DBError('findManyBy expects an array of values', {
+        method: 'findManyBy',
+        column: col
+      });
+    }
     if (!values.length) return [];
     return await this.query().whereIn(col, values).get();
   }
 
   // additional common accessors
   static async findMany(ids = []) {
-    if (!Array.isArray(ids)) ids = [ids];
+    // if (!Array.isArray(ids)) ids = [ids];
+    if (!Array.isArray(ids)) {
+      throw new DBError('findMany expects an array of IDs', {
+        method: 'findMany',
+        model: this.name,
+        ids
+      });
+    }
     if (!ids.length) return [];
     return await this.query().whereIn(this.primaryKey, ids).get();
   }
@@ -3062,7 +3424,10 @@ class Model {
 
     // 3. Block empty payload
     if (!Object.keys(payload).length) {
-      throw new DBError('Attempted to create with empty payload');
+      throw new DBError('Attempted to create with empty payload', {
+        model: this.name,
+        attrs
+      });
     }
 
     // 4. Create + save
@@ -3149,9 +3514,9 @@ class Model {
   // 🛡 SANITIZATION UTIL
   // ──────────────────────────────
   static isBadValue(value) {
-    if (value === null || value === undefined || value === '') return true;
-    if (typeof value === 'string' && !value.trim()) return true;
-    return false;
+    if (value === null || value === undefined) return true;
+    if (typeof value === 'string' && !value.trim()) return true; // empty string
+    return false; // allow 0, false, etc.
   }
 
   sanitize(attrs = {}) {
@@ -3162,7 +3527,7 @@ class Model {
       const val = attrs[key];
 
       if (!this.constructor.isBadValue(val)) {
-        clean[key] = val;
+        clean[key] = val;   // keep 0, false, etc.
       } else if (keepCols.includes(key)) {
         clean[key] = null;
       }
@@ -3176,13 +3541,24 @@ class Model {
   // ──────────────────────────────
   async fill(attrs = {}) {
     const allowed = this.constructor.fillable || Object.keys(attrs);
+    let filled = false;
 
     for (const key of Object.keys(attrs)) {
       const val = attrs[key];
-      if (allowed.includes(key) && !this.constructor.isBadValue(val)) {
-        this._attributes[key] = val;
+      if (allowed.includes(key) && val !== undefined) {
+        this._attributes[key] = val; // 0, false, null preserved
+        filled = true;
       }
     }
+
+    if (!filled && Object.keys(attrs).length > 0) {
+      throw new DBError('No fillable attributes provided', {
+        model: this.constructor.name,
+        attrs,
+        fillable: allowed
+      });
+    }
+
     return this;
   }
 
@@ -3194,17 +3570,25 @@ class Model {
   // INSERT – validation first
   // ──────────────────────────────
   async saveNew(attrs) {
+    this._attributes = { ...attrs }; 
+    
+    if (!Object.keys(this._attributes).length) {
+      throw new DBError('Cannot save empty model', {
+        model: this.constructor.name
+      });
+    }
+
     const payload = this.sanitize(attrs || this._attributes);
 
-    // Validate BEFORE hooks/db
+    // validate BEFORE hooks/db
     await this.constructor.validate(payload);
     await this.trigger('creating');
 
     // timestamps
     if (this.constructor.timestamps) {
       const now = new Date();
-      payload.created_at = payload.created_at || now;
-      payload.updated_at = payload.updated_at || now;
+      if (payload.created_at === undefined) payload.created_at = now;
+      if (payload.updated_at === undefined) payload.updated_at = now;
     }
 
     // soft deletes
@@ -3216,13 +3600,11 @@ class Model {
     }
 
     const qb = this.constructor.query();
-
     const result = await qb.insert(payload);
 
     // handle pk
     const pk = this.constructor.primaryKey;
     const insertId = Array.isArray(result) ? result[0] : result;
-
     if (!(pk in payload) && insertId !== undefined) {
       payload[pk] = insertId;
     }
@@ -3233,12 +3615,16 @@ class Model {
 
     return this;
   }
-
   // ──────────────────────────────
   // UPDATE – only dirty fields
   // ──────────────────────────────
   async save() {
-    if (!this._exists) return this.saveNew(this._attributes);
+    // if (!this._exists) return this.saveNew(this._attributes);
+    if (!this._exists && !Object.keys(this._attributes).length) {
+      throw new DBError('Cannot save empty model', {
+        model: this.constructor.name
+      });
+    }
 
     await this.trigger('updating');
 
@@ -3249,11 +3635,8 @@ class Model {
     for (const key of Object.keys(attrs)) {
       const val = attrs[key];
 
-      if (val !== orig[key] && !this.constructor.isBadValue(val)) {
-        if (this.constructor.softDeletes &&
-            key === this.constructor.deletedAt) {
-          continue;
-        }
+      if (val !== orig[key] && val !== undefined) { // only treat undefined as "no change"
+        if (this.constructor.softDeletes && key === this.constructor.deletedAt) continue;
         dirty[key] = val;
       }
     }
@@ -3270,14 +3653,10 @@ class Model {
 
     // validate BEFORE db write
     const pk = this.constructor.primaryKey;
-    await this.constructor.validate(
-      { ...this._original, ...payload },
-      this._attributes[pk]
-    );
+    await this.constructor.validate({ ...this._original, ...payload }, this._attributes[pk]);
 
     const id = this._attributes[pk];
     const qb = this.constructor.query();
-
     await qb.where(pk, id).update(payload);
 
     this._original = { ...this.sanitize(this._attributes) };
@@ -3311,8 +3690,13 @@ class Model {
       let rel;
       try {
         rel = fn.call(dummy);
-      } catch {
-        continue;
+      } catch (err) {
+        // continue;
+        throw new DBError('Failed to resolve relation', {
+          model: this.name,
+          relation: name,
+          err
+        });
       }
 
       if (!rel) continue;
@@ -3380,8 +3764,13 @@ class Model {
         // RESTRICT — block delete
         // ──────────────────────────────────
         case 'restrict':
-          throw new Error(
-            `Cannot delete ${this.constructor.name}: related ${relName} exists`
+          throw new DBError(
+            `Cannot delete ${this.constructor.name}: related ${relName} exists`,
+            {
+              model: this.constructor.name,
+              relation: relName,
+              behavior: 'restrict'
+            }
           );
 
         // ──────────────────────────────────
@@ -3443,7 +3832,14 @@ class Model {
 
 
   static async destroy(ids) {
-    if (!Array.isArray(ids)) ids = [ids];
+    if (!Array.isArray(ids)) {
+      throw new DBError('destroy expects an array of IDs', {
+        model: this.name,
+        ids
+      });
+    }
+
+    // if (!Array.isArray(ids)) ids = [ids];
     const pk = this.primaryKey;
 
     // --- Load models so cascade works ---
@@ -3603,7 +3999,12 @@ class Model {
 
   async refresh() {
     const pk = this.constructor.primaryKey;
-    if (!this._attributes[pk]) return this;
+    // if (!this._attributes[pk]) return this;
+    if (!this._attributes[pk]) {
+      throw new DBError('Cannot refresh model without primary key', {
+        model: this.constructor.name
+      });
+    }
     const fresh = await this.constructor.find(this._attributes[pk]);
     if (fresh) {
       this._attributes = { ...fresh._attributes };
@@ -3626,6 +4027,204 @@ class Model {
     return dirty;
   }
 }
+
+/* -------------------- DB Model -------------------- */
+class Session extends Model {
+  static table = 'sessions';
+  static primaryKey = 'sid';
+  static slugKey = null;
+  static timestamps = false;
+
+  static fillable = ['sid', 'data', 'expires'];
+}
+
+/* -------------------- Optional Session Model -------------------- */
+let SessionModel = null;
+
+try {
+  SessionModel = Session;
+} catch (err) {
+  SessionModel = null;
+}
+
+/* -------------------- Store -------------------- */
+const { promisify } = require('node:util');
+
+const gzip = promisify(zlib.gzip);
+const gunzip = promisify(zlib.gunzip);
+
+class LamixSessionStore extends session.Store {
+  constructor(options = {}) {
+    super();
+
+    this.ttl = options.ttl || 86400; // seconds
+    this.cleanupInterval = options.cleanupInterval || 60000;
+
+    this._startCleanup();
+  }
+
+  /* ---------- Get ---------- */
+
+  async get(sid, cb) {
+    try {
+      const now = Date.now();
+
+      const row = await Session
+        .query()
+        .where('sid', sid)
+        .where('expires', '>', now)
+        .first();
+
+      if (!row) return cb(null, null);
+
+      let sessionJSON;
+
+      // ---------- Step 1: Decompress ----------
+      try {
+        const buffer = Buffer.from(row.data, 'base64');
+        const decompressed = await gunzip(buffer);
+        sessionJSON = decompressed.toString('utf8');
+      } catch {
+        // fallback to legacy plain JSON
+        sessionJSON = row.data;
+      }
+
+      // ---------- Step 2: Parse JSON safely ----------
+      try {
+        const parsed = JSON.parse(sessionJSON);
+        return cb(null, parsed);
+      } catch (parseErr) {
+        console.warn('Corrupted session detected. Destroying:', sid);
+
+        // destroy corrupted session
+        await Session
+          .query()
+          .where('sid', sid)
+          .delete();
+
+        return cb(null, null); // treat as no session
+      }
+
+    } catch (err) {
+      console.error('Session GET failed:', err);
+
+      // IMPORTANT: never pass fatal error to express-session
+      return cb(null, null);
+    }
+  }
+
+  /* ---------- Set ---------- */
+
+  async set(sid, sessionData, cb) {
+    try {
+      const expires =
+        sessionData.cookie?.expires
+          ? new Date(sessionData.cookie.expires).getTime()
+          : Date.now() + this.ttl * 1000;
+
+      const json = JSON.stringify(sessionData);
+
+      // Async compression (non-blocking)
+      const compressed = await gzip(json);
+      const base64Data = compressed.toString('base64');
+
+      const payload = {
+        sid,
+        data: base64Data,
+        expires
+      };
+
+      const existing = await Session
+        .query()
+        .where('sid', sid)
+        .first();
+
+      if (existing) {
+        await existing.update(payload);
+      } else {
+        const session = new Session(payload, false);
+        await session.saveNew(payload);
+      }
+
+      cb(null);
+    } catch (err) {
+      cb(new DBError('Failed to persist session', {
+        sid,
+        operation: 'set',
+        err
+      }));
+    }
+  }
+
+  /* ---------- Destroy ---------- */
+
+  async destroy(sid, cb) {
+    try {
+      await Session
+        .query()
+        .where('sid', sid)
+        .delete();
+
+      cb(null);
+    } catch (err) {
+      cb(new DBError('Failed to destroy session', {
+        sid,
+        operation: 'destroy',
+        err
+      }));
+    }
+  }
+
+  /* ---------- Touch ---------- */
+
+  async touch(sid, sessionData, cb) {
+    if (!sessionData) return cb(null);
+
+    try {
+      const expires =
+        sessionData.cookie?.expires
+          ? new Date(sessionData.cookie.expires).getTime()
+          : Date.now() + this.ttl * 1000;
+
+      await Session
+        .query()
+        .where('sid', sid)
+        .update({ expires });
+
+      cb();
+    } catch (err) {
+      cb(new DBError('Failed to touch session', {
+        sid,
+        operation: 'touch',
+        err
+      }));
+    }
+  }
+
+  /* ---------- Cleanup ---------- */
+
+  _startCleanup() {
+    this._cleanupTimer = setInterval(async () => {
+      try {
+        await Session
+          .query()
+          .where('expires', '<', Date.now())
+          .delete();
+      } catch (err) {
+        console.error(
+          new DBError('Session cleanup failed', {
+            operation: 'cleanup',
+            err
+          })
+        );
+      }
+    }, this.cleanupInterval);
+
+    this._cleanupTimer.unref();
+  }
+}
+
+
 
 // --- BaseModel with bcrypt hashing ---
 const bcrypt = tryRequire('bcrypt');
@@ -3715,4 +4314,4 @@ class BaseModel extends Model {
   }
 }
 
-module.exports = { DB, Model, Validator, ValidationError, Collection, QueryBuilder, HasMany, HasOne, BelongsTo, BelongsToMany, DBError, BaseModel};
+module.exports = { DB, Model, Validator, ValidationError, Collection, QueryBuilder, HasMany, HasOne, BelongsTo, BelongsToMany, DBError, LamixSessionStore, BaseModel};
