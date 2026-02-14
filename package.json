@@ -1,29 +1,27 @@
 {
   "name": "lamix",
-  "version": "4.2.7",
+  "version": "4.2.23",
   "description": "lamix - ORM for Node-express js",
-  "main": "index.js",
-  "types": "index.d.ts",
+  "main": "./lib/index.js",
+  "type": "commonjs",
   "exports": {
     ".": {
-      "import": "./index.js",
-      "require": "./index.js",
-      "types": "./index.d.ts"
+      "require": "./lib/index.js",
+      "types": "./lib/@types/index.d.ts"
     }
   },
   "files": [
-    "index.js",
-    "index.d.ts",
-    "artisan.js",
-    "README.md",
-    "examples"
+    "lib",
+    "bin"
   ],
   "repository": {
     "type": "git",
     "url": "https://github.com/andrewkhabweri-spec/lamix.git"
   },
+  "bin": {
+    "lamix": "./bin/cli.js"
+  },
   "scripts": {
-    "artisan": "node artisan.js",
     "build": "tsc && echo 'Build complete'"
   },
   "devDependencies": {
@@ -32,29 +30,25 @@
   },
   "dependencies": {
     "bcrypt": "^6.0.0",
-    "chalk": "^4.1.2",
-    "dotenv": "^17.2.2"
+    "express-session": "^1.19.0",
+    "lru-cache": "^11.2.5",
+    "chalk": "^5.6.2",
+    "dotenv": "^17.2.4 "
   },
   "keywords": [
     "lamix",
     "orm",
     "nodejs",
     "database",
-    "laravel-inspired"
+    "express",
+    "sql"
   ],
   "author": {
     "name": "Andrew Khabweri",
     "email": "andrewkhabweri@gmail.com"
   },
-  "tsdown": {
-    "entry": [
-      "index.d.ts"
-    ],
-    "outDir": ".",
-    "clean": true,
-    "dts": true,
-    "sourcemaps": true,
-    "theme": "default"
-  },
-  "license": "MIT"
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  }
 }
