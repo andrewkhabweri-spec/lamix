@@ -274,6 +274,8 @@ async function runMigrations() {
   DB.initFromEnv();
   await DB.connect();
 
+  await ensureSessionsTable();
+
   const applied = await getAppliedMigrations();
   const files = fs.readdirSync(MIGRATIONS_DIR)
     .filter(f => f.endsWith('.js'))
@@ -347,6 +349,63 @@ async function tableExists(tableName) {
   }
   return false;
 }
+
+// ------------------ SESSION hELPER ------------------
+
+async function ensureSessionsTable() {
+  const exists = await tableExists('sessions');
+  if (exists) {
+    log.info('ℹ️ sessions table already exists. Skipping.');
+    return;
+  }
+
+  log.info('⚙️ Creating sessions table...');
+
+  if (DB.driver === 'mysql') {
+    await DB.raw(`
+      CREATE TABLE sessions (
+        sid VARCHAR(255) PRIMARY KEY,
+        data TEXT NOT NULL,
+        expires BIGINT NOT NULL
+      )
+    `);
+
+    await DB.raw(`
+      CREATE INDEX idx_sessions_expires ON sessions (expires)
+    `);
+  }
+
+  if (DB.driver === 'sqlite') {
+    await DB.raw(`
+      CREATE TABLE sessions (
+        sid TEXT PRIMARY KEY,
+        data TEXT NOT NULL,
+        expires INTEGER NOT NULL
+      )
+    `);
+
+    await DB.raw(`
+      CREATE INDEX idx_sessions_expires ON sessions (expires)
+    `);
+  }
+
+  if (DB.driver === 'pg') {
+    await DB.raw(`
+      CREATE TABLE sessions (
+        sid VARCHAR(255) PRIMARY KEY,
+        data TEXT NOT NULL,
+        expires BIGINT NOT NULL
+      )
+    `);
+
+    await DB.raw(`
+      CREATE INDEX idx_sessions_expires ON sessions (expires)
+    `);
+  }
+
+  log.success('✅ sessions table created successfully.');
+}
+
 
 
 async function rollbackLastMigration() {
@@ -592,22 +651,21 @@ module.exports = ${className};
 📦 CLI Migration & Seeder Tool
 
 Usage:
-   npm run artisan --
+   npx lamix
   🔹 Migration Commands:
-    npm run artisan -- make:migration <TableName> [columns]
-    npm run artisan -- migrate
-    npm run artisan -- migrate:rollback
+    make:migration <TableName> [column:type ...]
+    migrate
+    migrate:rollback
 
   🔹 Seeder Commands:
-    npm run artisan -- make:seeder <name>
-    npm run artisan -- db:seed
-    npm run artisan -- db:seed:refresh
-    npm run artisan -- db:seed:only <filename.js>
+    make:seeder <name>
+    db:seed
+    db:seed:refresh
+    db:seed:only <file>
 
   🔹 Model Generator:
-    npm run artisan -- make:model <name>
-    npm run artisan -- make:model <ModelName> [field:type ...]
-    npm run artisan -- make:model <name> name:string price:decimal stock:integer
+    make:model <Name>
+    make:model <Name> field:type field:type
 `);
   }
 })();
