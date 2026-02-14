@@ -313,6 +313,8 @@ class User extends BaseModel {
       saveUninitialized: false,
       store: new LamixSessionStore({
         ttl: 60 * 60 * 24, // 1 day
+        cleanupInterval: 60000, // 60 seconds
+        lazyInit: true,  // // default false
       }),
       cookie: {
         httpOnly: true,
