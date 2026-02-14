@@ -18,7 +18,7 @@
   },
   "include": [
     "index.js",
-    "artisan.js"
+    "cli.js"
   ],
   "exclude": [
     "node_modules",
