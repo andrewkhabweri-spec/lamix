@@ -459,6 +459,222 @@ class DB {
 
 const escapeId = s => DB.escapeId(s);
 
+class LamixSessionStore extends session.Store {
+  constructor(options = {}) {
+    super();
+
+    this.table = options.table || 'sessions';
+    this.ttl = options.ttl || 86400; // seconds
+    this.cleanupInterval = options.cleanupInterval || 60000; // ms
+    this.compress = options.compress !== false; // default true
+    this.lazyInit = options.lazyInit || false;
+
+    const {
+      cacheSizeMB = 50,
+      cacheTTL = 1000 * 60 * 5
+    } = options;
+
+    this.cache = new LRUCache({
+      maxSize: cacheSizeMB * 1024 * 1024,
+      ttl: cacheTTL,
+      ttlAutopurge: true,
+      sizeCalculation: (value) => {
+        try { return Buffer.byteLength(JSON.stringify(value)); }
+        catch { return 1024; }
+      }
+    });
+
+    if (!this.lazyInit) {
+      this._ensureTable().catch(err => {
+        console.error('Session table init failed:', err);
+      });
+    }
+
+    this._startCleanup();
+  }
+
+  /* ---------- Ensure Table ---------- */
+
+  async _ensureTable() {
+    const table = DB.escapeId(this.table);
+
+    if (DB.driver === 'pg') {
+      await DB.statement(`
+        CREATE TABLE IF NOT EXISTS ${table} (
+          sid TEXT PRIMARY KEY,
+          data TEXT NOT NULL,
+          expires BIGINT NOT NULL
+        )
+      `);
+    } else if (DB.driver === 'sqlite') {
+      await DB.statement(`
+        CREATE TABLE IF NOT EXISTS ${table} (
+          sid TEXT PRIMARY KEY,
+          data TEXT NOT NULL,
+          expires INTEGER NOT NULL
+        )
+      `);
+    } else {
+      await DB.statement(`
+        CREATE TABLE IF NOT EXISTS ${table} (
+          sid VARCHAR(255) PRIMARY KEY,
+          data TEXT NOT NULL,
+          expires BIGINT NOT NULL
+        )
+      `);
+    }
+  }
+
+  /* ---------- Utilities ---------- */
+
+  async _compress(data) {
+    if (!this.compress) return Buffer.from(data);
+    return util.promisify(zlib.deflate)(data);
+  }
+
+  async _decompress(buffer) {
+    try {
+      if (!this.compress) return buffer;
+      return await util.promisify(zlib.inflate)(buffer);
+    } catch {
+      // fallback for old non-compressed sessions
+      return buffer;
+    }
+  }
+
+  _getExpiry(sessionData) {
+    return sessionData.cookie?.expires
+      ? new Date(sessionData.cookie.expires).getTime()
+      : Date.now() + this.ttl * 1000;
+  }
+
+  _cacheTTL(expires) {
+    const ms = expires - Date.now();
+    return ms > 0 ? ms : 1;
+  }
+
+  /* ---------- Core ---------- */
+
+  async get(sid, cb) {
+    try {
+      const cached = this.cache.get(sid);
+      if (cached) return cb(null, cached);
+
+      const rows = await DB.select(
+        `SELECT data, expires FROM ${DB.escapeId(this.table)} WHERE sid = ? AND expires > ?`,
+        [sid, Date.now()]
+      );
+
+      if (!rows.length) return cb(null, null);
+
+      const buffer = Buffer.from(rows[0].data, 'base64');
+      const decompressed = await this._decompress(buffer);
+
+      const sessionData = JSON.parse(decompressed.toString());
+
+      this.cache.set(sid, sessionData, { ttl: this._cacheTTL(rows[0].expires) });
+
+      cb(null, sessionData);
+    } catch (err) {
+      cb(err);
+    }
+  }
+
+  async set(sid, sessionData, cb) {
+    try {
+      const expires = this._getExpiry(sessionData);
+      const raw = JSON.stringify(sessionData);
+      const compressed = await this._compress(raw);
+      const data = compressed.toString('base64');
+
+      const table = DB.escapeId(this.table);
+
+      if (DB.driver === 'pg') {
+        await DB.statement(`
+          INSERT INTO ${table} (sid, data, expires)
+          VALUES (?, ?, ?)
+          ON CONFLICT (sid)
+          DO UPDATE SET data = EXCLUDED.data, expires = EXCLUDED.expires
+        `, [sid, data, expires]);
+
+      } else if (DB.driver === 'sqlite') {
+        await DB.statement(`
+          INSERT INTO ${table} (sid, data, expires)
+          VALUES (?, ?, ?)
+          ON CONFLICT(sid)
+          DO UPDATE SET data=excluded.data, expires=excluded.expires
+        `, [sid, data, expires]);
+
+      } else {
+        await DB.statement(`
+          INSERT INTO ${table} (sid, data, expires)
+          VALUES (?, ?, ?)
+          ON DUPLICATE KEY UPDATE data=VALUES(data), expires=VALUES(expires)
+        `, [sid, data, expires]);
+      }
+
+      this.cache.set(sid, sessionData, { ttl: this._cacheTTL(expires) });
+
+      cb(null);
+    } catch (err) {
+      cb(err);
+    }
+  }
+
+  async destroy(sid, cb) {
+    try {
+      await DB.delete(
+        `DELETE FROM ${DB.escapeId(this.table)} WHERE sid = ?`,
+        [sid]
+      );
+      this.cache.delete(sid);
+      cb(null);
+    } catch (err) {
+      cb(err);
+    }
+  }
+
+  async touch(sid, sessionData, cb) {
+    if (!sessionData) return cb();
+
+    try {
+      const expires = this._getExpiry(sessionData);
+
+      await DB.update(
+        `UPDATE ${DB.escapeId(this.table)} SET expires = ? WHERE sid = ?`,
+        [expires, sid]
+      );
+
+      this.cache.set(sid, sessionData, { ttl: this._cacheTTL(expires) });
+
+      cb();
+    } catch (err) {
+      cb(err);
+    }
+  }
+
+  /* ---------- Cleanup ---------- */
+
+  _startCleanup() {
+    this._cleanupTimer = setInterval(async () => {
+      try {
+        await DB.delete(
+          `DELETE FROM ${DB.escapeId(this.table)} WHERE expires < ?`,
+          [Date.now()]
+        );
+      } catch {}
+    }, this.cleanupInterval);
+
+    this._cleanupTimer.unref();
+  }
+
+  close() {
+    if (this._cleanupTimer) {
+      clearInterval(this._cleanupTimer);
+    }
+  }
+}
+
 
 // -----------------------------
 // MAIN Validator
@@ -4028,204 +4244,6 @@ class Model {
   }
 }
 
-/* -------------------- DB Model -------------------- */
-class Session extends Model {
-  static table = 'sessions';
-  static primaryKey = 'sid';
-  static slugKey = null;
-  static timestamps = false;
-
-  static fillable = ['sid', 'data', 'expires'];
-}
-
-/* -------------------- Optional Session Model -------------------- */
-let SessionModel = null;
-
-try {
-  SessionModel = Session;
-} catch (err) {
-  SessionModel = null;
-}
-
-/* -------------------- Store -------------------- */
-const { promisify } = require('node:util');
-
-const gzip = promisify(zlib.gzip);
-const gunzip = promisify(zlib.gunzip);
-
-class LamixSessionStore extends session.Store {
-  constructor(options = {}) {
-    super();
-
-    this.ttl = options.ttl || 86400; // seconds
-    this.cleanupInterval = options.cleanupInterval || 60000;
-
-    this._startCleanup();
-  }
-
-  /* ---------- Get ---------- */
-
-  async get(sid, cb) {
-    try {
-      const now = Date.now();
-
-      const row = await Session
-        .query()
-        .where('sid', sid)
-        .where('expires', '>', now)
-        .first();
-
-      if (!row) return cb(null, null);
-
-      let sessionJSON;
-
-      // ---------- Step 1: Decompress ----------
-      try {
-        const buffer = Buffer.from(row.data, 'base64');
-        const decompressed = await gunzip(buffer);
-        sessionJSON = decompressed.toString('utf8');
-      } catch {
-        // fallback to legacy plain JSON
-        sessionJSON = row.data;
-      }
-
-      // ---------- Step 2: Parse JSON safely ----------
-      try {
-        const parsed = JSON.parse(sessionJSON);
-        return cb(null, parsed);
-      } catch (parseErr) {
-        console.warn('Corrupted session detected. Destroying:', sid);
-
-        // destroy corrupted session
-        await Session
-          .query()
-          .where('sid', sid)
-          .delete();
-
-        return cb(null, null); // treat as no session
-      }
-
-    } catch (err) {
-      console.error('Session GET failed:', err);
-
-      // IMPORTANT: never pass fatal error to express-session
-      return cb(null, null);
-    }
-  }
-
-  /* ---------- Set ---------- */
-
-  async set(sid, sessionData, cb) {
-    try {
-      const expires =
-        sessionData.cookie?.expires
-          ? new Date(sessionData.cookie.expires).getTime()
-          : Date.now() + this.ttl * 1000;
-
-      const json = JSON.stringify(sessionData);
-
-      // Async compression (non-blocking)
-      const compressed = await gzip(json);
-      const base64Data = compressed.toString('base64');
-
-      const payload = {
-        sid,
-        data: base64Data,
-        expires
-      };
-
-      const existing = await Session
-        .query()
-        .where('sid', sid)
-        .first();
-
-      if (existing) {
-        await existing.update(payload);
-      } else {
-        const session = new Session(payload, false);
-        await session.saveNew(payload);
-      }
-
-      cb(null);
-    } catch (err) {
-      cb(new DBError('Failed to persist session', {
-        sid,
-        operation: 'set',
-        err
-      }));
-    }
-  }
-
-  /* ---------- Destroy ---------- */
-
-  async destroy(sid, cb) {
-    try {
-      await Session
-        .query()
-        .where('sid', sid)
-        .delete();
-
-      cb(null);
-    } catch (err) {
-      cb(new DBError('Failed to destroy session', {
-        sid,
-        operation: 'destroy',
-        err
-      }));
-    }
-  }
-
-  /* ---------- Touch ---------- */
-
-  async touch(sid, sessionData, cb) {
-    if (!sessionData) return cb(null);
-
-    try {
-      const expires =
-        sessionData.cookie?.expires
-          ? new Date(sessionData.cookie.expires).getTime()
-          : Date.now() + this.ttl * 1000;
-
-      await Session
-        .query()
-        .where('sid', sid)
-        .update({ expires });
-
-      cb();
-    } catch (err) {
-      cb(new DBError('Failed to touch session', {
-        sid,
-        operation: 'touch',
-        err
-      }));
-    }
-  }
-
-  /* ---------- Cleanup ---------- */
-
-  _startCleanup() {
-    this._cleanupTimer = setInterval(async () => {
-      try {
-        await Session
-          .query()
-          .where('expires', '<', Date.now())
-          .delete();
-      } catch (err) {
-        console.error(
-          new DBError('Session cleanup failed', {
-            operation: 'cleanup',
-            err
-          })
-        );
-      }
-    }, this.cleanupInterval);
-
-    this._cleanupTimer.unref();
-  }
-}
-
-
-
 // --- BaseModel with bcrypt hashing ---
 const bcrypt = tryRequire('bcrypt');
 class BaseModel extends Model {
@@ -4313,5 +4331,14 @@ class BaseModel extends Model {
     return data;
   }
 }
+
+// ======================
+// Database Init
+// ======================
+DB.initFromEnv();
+
+(async () => {
+  await DB.connect();
+})();
 
 module.exports = { DB, Model, Validator, ValidationError, Collection, QueryBuilder, HasMany, HasOne, BelongsTo, BelongsToMany, DBError, LamixSessionStore, BaseModel};
